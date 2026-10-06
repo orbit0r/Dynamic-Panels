@@ -41,6 +41,20 @@ local SKIP = {
 	ElvUI_ContainerFrame = true,
 	ElvUI_BankContainerFrame = true,
 	ScriptErrorsFrame = true,
+	-- Esc / settings — SetAttribute or SetPoint here taints ToggleGameMenu.
+	GameMenuFrame = true,
+	GameMenuButtonContinue = true,
+	SettingsPanel = true,
+	OptionsFrame = true,
+	InterfaceOptionsFrame = true,
+	VideoOptionsFrame = true,
+	AudioOptionsFrame = true,
+	MacroFrame = true,
+	KeyBindingFrame = true,
+	StaticPopup1 = true,
+	StaticPopup2 = true,
+	StaticPopup3 = true,
+	StaticPopup4 = true,
 }
 
 local DEFAULTS = {
@@ -223,35 +237,36 @@ local function CloseButtonFocus(focus)
 end
 
 local function TakeOverPanel(name)
+	-- Never SetAttribute on Blizzard frames — that taints Esc / ToggleGameMenu.
 	if UIPanelWindows and UIPanelWindows[name] then
 		UIPanelWindows[name] = nil
-	end
-	local frame = _G[name]
-	if frame and frame.SetAttribute then
-		frame:SetAttribute('UIPanelLayout-enabled', false)
 	end
 end
 
 local function ApplyPos(name)
+	if InCombatLockdown and InCombatLockdown() then return end
 	local pos = DB().pos[name]
 	local frame = _G[name]
 	if not pos or not frame or not frame.SetPoint then return end
+	if SKIP[name] or ShouldSkip(frame) then return end
 	applying = true
-	if pos.w and pos.h and frame.SetSize then
-		frame:SetSize(pos.w, pos.h)
-	elseif pos.w and frame.SetWidth then
-		frame:SetWidth(pos.w)
-	elseif pos.h and frame.SetHeight then
-		frame:SetHeight(pos.h)
-	end
-	frame:ClearAllPoints()
-	frame:SetPoint('BOTTOMLEFT', UIParent, 'BOTTOMLEFT', pos.x, pos.y)
+	pcall(function()
+		if pos.w and pos.h and frame.SetSize then
+			frame:SetSize(pos.w, pos.h)
+		elseif pos.w and frame.SetWidth then
+			frame:SetWidth(pos.w)
+		elseif pos.h and frame.SetHeight then
+			frame:SetHeight(pos.h)
+		end
+		frame:ClearAllPoints()
+		frame:SetPoint('BOTTOMLEFT', UIParent, 'BOTTOMLEFT', pos.x, pos.y)
+	end)
 	applying = nil
 end
 
 local function SavePos(frame)
 	local name = FrameName(frame)
-	if not name then return end
+	if not name or SKIP[name] then return end
 	local x, y = frame:GetLeft(), frame:GetBottom()
 	if not x or not y then return end
 	local w, h = frame:GetWidth(), frame:GetHeight()
@@ -265,23 +280,26 @@ local function SavePos(frame)
 end
 
 local function ResetFrame(name)
+	if SKIP[name] then return end
 	DB().pos[name] = nil
 	local frame = _G[name]
-	if frame and frame.IsShown and frame:IsShown() and HideUIPanel and ShowUIPanel then
-		HideUIPanel(frame)
-		ShowUIPanel(frame)
+	-- Avoid HideUIPanel/ShowUIPanel — they run protected layout under addon taint.
+	if frame and frame.ClearAllPoints then
+		print('|cff1784d1Dynamic Panels|r reset ' .. name .. ' (reopen the panel for default layout)')
+	else
+		print('|cff1784d1Dynamic Panels|r reset ' .. name)
 	end
-	print('|cff1784d1Dynamic Panels|r reset ' .. name)
 end
 
 local function HookKeep(frame)
 	if frame.DynamicPanelsHooked then return end
-	frame.DynamicPanelsHooked = true
 	local name = FrameName(frame)
-	if not name then return end
+	if not name or SKIP[name] then return end
+	frame.DynamicPanelsHooked = true
 
 	hooksecurefunc(frame, 'SetPoint', function()
 		if applying or active then return end
+		if InCombatLockdown and InCombatLockdown() then return end
 		if DB().pos[name] then
 			ApplyPos(name)
 		end
@@ -290,10 +308,11 @@ local function HookKeep(frame)
 	if frame.SetSize then
 		hooksecurefunc(frame, 'SetSize', function()
 			if applying or active then return end
+			if InCombatLockdown and InCombatLockdown() then return end
 			local pos = DB().pos[name]
 			if pos and pos.w and pos.h then
 				applying = true
-				frame:SetSize(pos.w, pos.h)
+				pcall(frame.SetSize, frame, pos.w, pos.h)
 				applying = nil
 			end
 		end)
@@ -308,19 +327,24 @@ local function HookKeep(frame)
 end
 
 local function PrepareFrame(frame)
-	frame:SetMovable(true)
-	frame:SetClampedToScreen(true)
-	if frame.SetResizable then
-		frame:SetResizable(true)
-	end
-	if frame.SetResizeBounds then
-		frame:SetResizeBounds(MIN_W, MIN_H)
-	elseif frame.SetMinResize then
-		frame:SetMinResize(MIN_W, MIN_H)
-	end
-	if frame.EnableMouse then
-		frame:EnableMouse(true)
-	end
+	if InCombatLockdown and InCombatLockdown() then return end
+	local name = FrameName(frame)
+	if name and SKIP[name] then return end
+	pcall(function()
+		frame:SetMovable(true)
+		frame:SetClampedToScreen(true)
+		if frame.SetResizable then
+			frame:SetResizable(true)
+		end
+		if frame.SetResizeBounds then
+			frame:SetResizeBounds(MIN_W, MIN_H)
+		elseif frame.SetMinResize then
+			frame:SetMinResize(MIN_W, MIN_H)
+		end
+		if frame.EnableMouse then
+			frame:EnableMouse(true)
+		end
+	end)
 	HookKeep(frame)
 end
 
@@ -421,19 +445,21 @@ driver:SetScript('OnUpdate', function()
 	rightWasDown = right and true or false
 end)
 
-if type(UpdateUIPanelPositions) == 'function' then
-	hooksecurefunc('UpdateUIPanelPositions', function()
-		for name in pairs(DB().pos) do
-			ApplyPos(name)
-		end
-	end)
-end
+-- Do NOT hook UpdateUIPanelPositions: Esc → CloseWindows runs that under a
+-- protected path; ApplyPos SetSize/SetPoint there causes ADDON_ACTION_BLOCKED.
+-- OnShow + SetPoint hooks are enough to keep saved positions.
 
 local boot = CreateFrame('Frame')
 boot:RegisterEvent('PLAYER_LOGIN')
 boot:SetScript('OnEvent', function(self)
 	self:UnregisterEvent('PLAYER_LOGIN')
 	local db = DB()
+	-- Drop any saved Esc/settings frames from older versions (they taint ToggleGameMenu).
+	for name in pairs(db.pos) do
+		if SKIP[name] or name:find('^GameMenu') or name:find('Settings') or name:find('OptionsFrame') then
+			db.pos[name] = nil
+		end
+	end
 	for name in pairs(db.pos) do
 		local frame = _G[name]
 		if frame then
